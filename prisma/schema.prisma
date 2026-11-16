@@ -1,0 +1,714 @@
+// GTM Intelligence Engine — core data model.
+//
+// Design note: Signal.type/category, Persona, Product, ICPRule, and ScoringRule
+// are intentionally modeled as data rows (or plain validated strings) rather than
+// Prisma enums / hard-coded business logic. That is what lets the ICP definition,
+// signal taxonomy, and scoring rules be swapped per-vertical via configuration
+// (see config/meridian/*) without a schema migration. Structural workflow state
+// (AccountStatus, ActivityStatus, OutcomeType, evidence linking) uses real
+// enums/relations because that part of the pipeline is not vertical-specific.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Account & Contact
+// ---------------------------------------------------------------------------
+
+enum AccountStatus {
+  NEW
+  RESEARCHING
+  QUALIFIED
+  OPPORTUNITY
+  CUSTOMER
+  DISQUALIFIED
+  DORMANT
+}
+
+model Account {
+  id          String   @id @default(cuid())
+  companyName String
+  website     String?
+  country     String?
+  companyType String? // e.g. Ship Manager, Ship Owner, Fleet Operator — config-defined values
+  fleetSize   Int?
+  vesselTypes String[] @default([])
+  regions     String[] @default([])
+
+  // Denormalized latest-score cache for fast listing/sorting. Source of truth is Score.
+  icpScore     Int? // latest Score.icpFit (0-25)
+  currentScore Int? // latest Score.total (0-100)
+
+  status     AccountStatus @default(NEW)
+  archivedAt DateTime? // soft-delete: non-null hides the account from default views without losing data
+
+  contacts      Contact[]
+  signals       Signal[]
+  insights      AccountInsight[]
+  scores        Score[]
+  activities    Activity[]
+  evidence      Evidence[]
+  facts         Fact[]
+  researchRuns  ResearchRun[]
+  activations   Activation[]
+  outcomeEvents OutcomeEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([archivedAt])
+  @@index([currentScore])
+  @@index([companyName])
+}
+
+model Contact {
+  id             String  @id @default(cuid())
+  accountId      String
+  account        Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name           String
+  title          String?
+  department     String?
+  linkedinUrl    String?
+  email          String?
+  seniority      String? // e.g. C_LEVEL, VP, DIRECTOR, MANAGER, IC — free text, small controlled vocabulary at app layer
+  influenceScore Int? // 0-100
+
+  personaId String?
+  persona   Persona? @relation(fields: [personaId], references: [id])
+
+  activities    Activity[]
+  activations   Activation[]
+  outcomeEvents OutcomeEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+  @@index([personaId])
+}
+
+// ---------------------------------------------------------------------------
+// Signal
+// ---------------------------------------------------------------------------
+
+enum SignalStatus {
+  ACTIVE // default at creation
+  EXPIRED // past its freshness window — set at creation time for provider-reported
+  // stale events; ongoing decay toward zero relevance is otherwise computed
+  // dynamically by the scoring engine (lib/scoring/decay.ts), not by flipping
+  // this column on a schedule. Signals are never deleted either way.
+  ARCHIVED // manually superseded/retracted
+}
+
+model Signal {
+  id        String       @id @default(cuid())
+  accountId String
+  account   Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  status    SignalStatus @default(ACTIVE)
+
+  // Validated at the app layer against config/meridian/signals.ts, not a DB enum,
+  // so the taxonomy can change without a migration.
+  category String // GROWTH | PEOPLE | COMPLIANCE | TECHNOLOGY | ENGAGEMENT (config-defined)
+  type     String // e.g. FLEET_EXPANSION, SIRE_ACTIVITY, DEMO_REQUEST (config-defined)
+
+  title       String
+  description String
+
+  sourceUrl  String?
+  sourceName String?
+
+  detectedAt DateTime
+  strength   Int // 1-5
+  confidence Int // 0-100
+
+  // Decay / expiration: a signal's relevance fades over time. expiresAt is the
+  // computed point after which the scoring engine should stop counting it.
+  decayHalfLifeDays Int?
+  expiresAt         DateTime?
+
+  evidence Evidence[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+  @@index([category])
+  @@index([type])
+  @@index([detectedAt])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// AI-generated intelligence (Research Agent + GTM Intelligence Agent outputs)
+// ---------------------------------------------------------------------------
+
+enum InsightKind {
+  RESEARCH // AI Research Agent output
+  GTM_INTELLIGENCE // GTM Intelligence Agent output
+}
+
+enum InsightStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model AccountInsight {
+  id        String      @id @default(cuid())
+  accountId String
+  account   Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  kind      InsightKind
+
+  status InsightStatus @default(PENDING)
+  error  String? // set when status = FAILED; never set alongside a populated `content`
+
+  // Structured payload, shape validated by Zod per `kind` at the app layer
+  // (see lib/ai/schemas/*). Kept as Json so the AI output schema can evolve
+  // without a migration. Null while PENDING or FAILED.
+  content Json?
+
+  provider      String @default("anthropic")
+  model         String // model id used to generate this insight
+  promptVersion String // version tag of the prompt template used
+
+  evidence Evidence[]
+
+  generatedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([accountId, kind])
+}
+
+// ---------------------------------------------------------------------------
+// Evidence / Source tracking
+// ---------------------------------------------------------------------------
+
+enum SourceType {
+  COMPANY_WEBSITE
+  NEWS
+  PRESS_RELEASE
+  LINKEDIN
+  REGULATORY_FILING
+  SIRE_RIGHTSHIP_DATABASE
+  MANUAL
+  OTHER
+}
+
+// Independent of SourceType and of Evidence.claimType (FACT/INFERENCE/
+// RECOMMENDATION) — this is "how authoritative is where this came from",
+// computed deterministically (config/meridian/sourceQuality.ts), never inferred by
+// a model. It never changes fact/inference semantics.
+enum SourceQuality {
+  OFFICIAL_PRIMARY // the company's own site, a regulatory filing, a vetting database
+  INDUSTRY_PUBLICATION // a recognized maritime trade publication
+  SECONDARY // general news/press-release, unrecognized outlet
+  UNKNOWN
+}
+
+model Source {
+  id          String        @id @default(cuid())
+  url         String?
+  name        String
+  publisher   String? // e.g. the domain/outlet name, when distinct from `name`
+  publishedAt DateTime? // when the source content was published, if known
+  sourceType  SourceType    @default(OTHER)
+  quality     SourceQuality @default(UNKNOWN)
+  retrievedAt DateTime      @default(now())
+
+  // Raw/extracted document content as retrieved by a ResearchProvider, kept
+  // for provenance and re-extraction. Never re-fetched/overwritten in place —
+  // a source found again (same URL) is reused, not replaced, so this reflects
+  // whatever was retrieved the first time it was seen.
+  rawContent String?
+
+  evidence Evidence[]
+  facts    Fact[]
+
+  createdAt DateTime @default(now())
+
+  @@index([sourceType])
+}
+
+// A structured statement extracted from a Source's content — the "FACT" stage
+// of SOURCE -> FACT -> SIGNAL -> SCORE -> INTELLIGENCE. Kept distinct from
+// Evidence: a Fact is a candidate extraction that may or may not go on to
+// evidence a Signal (deterministic signal detection reads Facts, not raw
+// Source content, to decide whether/what Signal to create).
+model Fact {
+  id        String  @id @default(cuid())
+  sourceId  String
+  source    Source  @relation(fields: [sourceId], references: [id])
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  statement  String
+  confidence Int? // 0-100
+  context    String? // date/context when available, e.g. "as of Q3 2026"
+
+  evidence Evidence[] // Evidence rows (e.g. on a Signal this fact led to) that cite this fact
+
+  extractedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([accountId])
+  @@index([sourceId])
+}
+
+enum ClaimType {
+  FACT // a verifiable assertion tied to a source
+  INFERENCE // an AI-drawn interpretation — never stored as though verified
+  RECOMMENDATION // a suggested next action, not a claim about reality
+}
+
+// Generic evidence link: a specific claim, tied to one Source, optionally
+// attached to an Account, a Signal, or an AccountInsight. This is what lets
+// every externally-derived claim in the product carry a citation, and what
+// keeps AI inference visually and structurally distinct from verified fact.
+model Evidence {
+  id        String  @id @default(cuid())
+  sourceId  String
+  source    Source  @relation(fields: [sourceId], references: [id])
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  signalId String?
+  signal   Signal? @relation(fields: [signalId], references: [id], onDelete: Cascade)
+
+  insightId String?
+  insight   AccountInsight? @relation(fields: [insightId], references: [id], onDelete: Cascade)
+
+  factId String?
+  fact   Fact?   @relation(fields: [factId], references: [id], onDelete: Cascade)
+
+  claim      String // the specific assertion this evidence supports
+  claimType  ClaimType @default(FACT)
+  confidence Int? // 0-100
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId])
+  @@index([signalId])
+  @@index([insightId])
+  @@index([factId])
+}
+
+// ---------------------------------------------------------------------------
+// Research runs (external ingestion + AI pipeline, one row per orchestrated run)
+// ---------------------------------------------------------------------------
+
+enum ResearchRunStatus {
+  PENDING
+  COMPLETED // every attempted step succeeded (or was gracefully skipped, e.g. no provider configured)
+  PARTIAL // some step failed but the run still produced something usable
+  FAILED // nothing useful was produced
+  SKIPPED // existing research was still within its freshness window — no
+  // external call was made at all. Only "Refresh Research" (force=true)
+  // bypasses this.
+}
+
+// One row per "Research Account" / "Refresh Research" click — the full
+// external-ingestion + AI orchestration (see lib/research/researchRun.ts).
+// Distinct from AccountInsight (which records just the two AI steps): this
+// tracks the whole run, including steps AccountInsight knows nothing about
+// (external retrieval, fact extraction, signal detection), and the score
+// before/after so "what changed" can be answered later without recomputation.
+model ResearchRun {
+  id        String            @id @default(cuid())
+  accountId String
+  account   Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  status    ResearchRunStatus @default(PENDING)
+
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  sourcesFound    Int @default(0)
+  factsExtracted  Int @default(0)
+  signalsDetected Int @default(0)
+
+  newSignalIds String[] @default([]) // Signal ids created during this run — the basis for "what's new"
+
+  scoreBefore Int? // Account.currentScore at the start of this run
+  scoreAfter  Int? // Account.currentScore after this run (only recalculated if signalsDetected > 0)
+
+  // References into AccountInsight for this run's Phase 4 research/why-now
+  // output. Plain ids, not a formal relation — this is a historical pointer,
+  // not something the app needs to join through.
+  researchInsightId String?
+  whyNowInsightId   String?
+
+  // Array of { step: string; message: string } — every step that failed or
+  // was skipped this run, so a PARTIAL/FAILED run is still fully explainable.
+  errors Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId])
+}
+
+// ---------------------------------------------------------------------------
+// Activation (Phase 5) — INTELLIGENCE -> RECOMMENDATION -> DRAFT ->
+// HUMAN REVIEW -> APPROVAL -> ACTIVITY. No external sending exists yet —
+// SENT is a manually-set terminal status with no side effects, ready for a
+// future integration to hang off of.
+// ---------------------------------------------------------------------------
+
+enum ActivationChannel {
+  LINKEDIN
+  EMAIL
+  SALES_BRIEF // internal intelligence brief, not outbound copy
+  CONTENT_RECOMMENDATION // a suggestion for content to create, never auto-published
+}
+
+enum ActivationStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  SENT
+  CANCELLED
+}
+
+model Activation {
+  id        String            @id @default(cuid())
+  accountId String
+  account   Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contactId String?
+  contact   Contact?          @relation(fields: [contactId], references: [id])
+  channel   ActivationChannel
+  status    ActivationStatus  @default(DRAFT)
+
+  objective String // what this activation is trying to accomplish, e.g. "Introduce MoorSense M4 to the DPA"
+
+  // Channel-specific structured draft, shape validated by Zod at the app
+  // layer (lib/ai/schemas/activation.ts) — see that file for why each
+  // channel has its own content shape rather than forcing one generic
+  // "message" field onto SALES_BRIEF/CONTENT_RECOMMENDATION.
+  content Json
+
+  // Denormalized out of `content` at creation time (LINKEDIN/EMAIL: angle/cta;
+  // CONTENT_RECOMMENDATION: contentAngle/suggestedCta; SALES_BRIEF: neither,
+  // both null) purely so Phase 6 analytics can group/filter by angle without
+  // parsing per-channel JSON shapes at query time. Never independently edited —
+  // editing content (updateActivationContent) re-derives these from the new
+  // content in the same call, so they can never drift out of sync with it.
+  angle String?
+  cta   String?
+
+  reasoning String // why this draft was generated the way it was — always shown alongside the draft, never hidden
+
+  // Evidence.id values the draft is actually grounded in. Validated against
+  // real Evidence rows for this account at generation time — a hallucinated
+  // id is dropped, never stored. The draft text itself is never treated as
+  // new evidence.
+  evidenceIds String[] @default([])
+
+  // The GTM_INTELLIGENCE AccountInsight (Why-Now) this activation was
+  // generated from, when one existed. Plain reference, not a formal
+  // relation — historical pointer only, same pattern as ResearchRun's
+  // insight references.
+  sourceInsightId String?
+
+  // Frozen at generation/regeneration time — the full GTM context (score +
+  // its component breakdown, which already carries the contributing signals
+  // and matched problems/products, the contact/persona, evidence, and the
+  // Why-Now/research snapshots) that produced this exact draft. Shape:
+  // ActivationContextSnapshot (lib/activation/snapshot.ts). This is Phase 6's
+  // attribution anchor — later outcome analysis reads this frozen JSON, never
+  // the account's *current* score/signals, so "what did we know when we
+  // reached out" can never silently drift as the account's live data changes.
+  contextSnapshot Json?
+
+  provider      String @default("anthropic")
+  model         String
+  promptVersion String
+
+  // Regeneration creates a new row rather than overwriting — this links it
+  // back to what it superseded, and the previous row is never deleted or
+  // modified.
+  regeneratedFromId String?
+  version           Int     @default(1)
+
+  createdBy  String? // free-text actor identifier
+  approvedBy String?
+  approvedAt DateTime?
+  rejectedAt DateTime?
+  sentAt     DateTime? // set manually; never the result of an external API call in this phase
+
+  outcomeEvents OutcomeEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+  @@index([contactId])
+  @@index([status])
+  @@index([channel])
+  @@index([angle])
+}
+
+// ---------------------------------------------------------------------------
+// Scoring
+// ---------------------------------------------------------------------------
+
+enum ScoringDimension {
+  ICP_FIT
+  SIGNAL_STRENGTH
+  PROBLEM_RELEVANCE
+  BUYING_PERSONA
+  ENGAGEMENT
+}
+
+// Configurable ICP model: each rule contributes points toward the ICP_FIT
+// dimension when an Account matches its condition. Never hard-coded.
+enum ICPOperator {
+  EQUALS
+  NOT_EQUALS
+  IN
+  NOT_IN
+  GTE
+  LTE
+  CONTAINS
+}
+
+model ICPRule {
+  id          String      @id @default(cuid())
+  name        String      @unique
+  description String?
+  field       String // Account field this rule evaluates, e.g. "companyType", "fleetSize", "regions"
+  operator    ICPOperator
+  value       Json // comparison value(s)
+  points      Int // points awarded when the rule matches
+  active      Boolean     @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Configurable weighting/config for each non-ICP scoring dimension, e.g. how
+// many points each signal category is worth toward SIGNAL_STRENGTH, or which
+// persona seniority tiers earn full BUYING_PERSONA points.
+model ScoringRule {
+  id          String           @id @default(cuid())
+  // One row per dimension: the engine looks up its config by dimension, so
+  // this is the real identity — `name` is just a freely-editable display label.
+  dimension   ScoringDimension @unique
+  name        String
+  description String?
+  maxPoints   Int
+  config      Json // dimension-specific configuration consumed by the scoring engine
+  active      Boolean          @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Score {
+  id        String  @id @default(cuid())
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  icpFit           Int // 0-25
+  signalStrength   Int // 0-25
+  problemRelevance Int // 0-20
+  buyingPersona    Int // 0-15
+  engagement       Int // 0-15
+  total            Int // 0-100
+
+  scoringVersion   String // identifies the rule set / algorithm version used
+  componentDetails Json // per-dimension breakdown + which rules/signals contributed, for explainability
+
+  computedAt DateTime @default(now())
+
+  @@index([accountId])
+  @@index([computedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Persona & Product (configurable GTM knowledge)
+// ---------------------------------------------------------------------------
+
+model Persona {
+  id            String  @id @default(cuid())
+  name          String  @unique // e.g. "Marine Manager", "DPA", "HSEQ Leader"
+  description   String?
+  department    String?
+  seniorityTier String? // e.g. LEADERSHIP, MANAGEMENT, OPERATIONAL
+  active        Boolean @default(true)
+
+  contacts Contact[]
+  products ProductPersona[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Product {
+  id                  String   @id @default(cuid())
+  name                String   @unique // e.g. "MoorSense M4"
+  description         String?
+  category            String?
+  painPointsAddressed String[] @default([])
+  relevantSignalTypes String[] @default([]) // config-defined Signal.type values
+  active              Boolean  @default(true)
+
+  personas ProductPersona[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ProductPersona {
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  personaId String
+  persona   Persona @relation(fields: [personaId], references: [id], onDelete: Cascade)
+
+  @@id([productId, personaId])
+}
+
+// ---------------------------------------------------------------------------
+// Activity & Outcome (activation workflow — human approval required)
+// ---------------------------------------------------------------------------
+
+enum ActivityType {
+  RESEARCH_RUN
+  GTM_ANALYSIS
+  ACTIVATION_DRAFT // LinkedIn message / email draft / sales brief / content asset generated by the Activation Agent
+  EMAIL_SENT
+  LINKEDIN_MESSAGE_SENT
+  CALL_LOGGED
+  MEETING_LOGGED
+  NOTE
+  STATUS_CHANGE
+}
+
+enum ActivityStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  COMPLETED
+}
+
+model Activity {
+  id        String   @id @default(cuid())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contactId String?
+  contact   Contact? @relation(fields: [contactId], references: [id])
+
+  type   ActivityType
+  status ActivityStatus @default(DRAFT)
+  title  String
+
+  // Activation Agent output lives here when type = ACTIVATION_DRAFT:
+  // { linkedinMessage?, emailDraft?, salesBrief?, contentAsset?, suggestedCta? }
+  payload Json?
+
+  createdBy  String? // free-text actor identifier (human or "agent")
+  approvedBy String?
+  approvedAt DateTime?
+
+  outcomes Outcome[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+  @@index([status])
+}
+
+enum OutcomeType {
+  NO_RESPONSE
+  REPLIED
+  MEETING_BOOKED
+  OPPORTUNITY_CREATED
+  CLOSED_WON
+  CLOSED_LOST
+  UNSUBSCRIBED
+  OTHER
+}
+
+model Outcome {
+  id         String      @id @default(cuid())
+  activityId String
+  activity   Activity    @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  type       OutcomeType
+  notes      String?
+  occurredAt DateTime    @default(now())
+
+  createdAt DateTime @default(now())
+
+  @@index([activityId])
+}
+
+// ---------------------------------------------------------------------------
+// Outcome events (Phase 6) — ACTIVATION -> OUTCOME -> ATTRIBUTION -> GTM
+// LEARNING. Deliberately a distinct model from the pre-existing
+// Activity/Outcome pair above (which is a Phase 2/3-era, Activity-scoped
+// engagement signal used only by the scoring engine's Engagement dimension):
+// OutcomeEvent is Phase 5 Activation-scoped, keyed directly to account/
+// contact/activation for explicit (never probabilistic) attribution, and is
+// an append-only log — an activation can accumulate any number of these, and
+// none is ever the sole "current status" of anything. Recording one never
+// mutates Fact/Source/Signal/Score/AccountInsight/Activation rows.
+// ---------------------------------------------------------------------------
+
+// Extensible on purpose: a new lifecycle event is one new enum value plus one
+// new entry in config/meridian/outcomeTypes.ts (label/description for the UI),
+// never a scattered set of code changes. This is a structural/workflow
+// vocabulary (not MMS-vertical-specific business taxonomy, unlike
+// Signal.type), so — per this file's own top-of-file design note — a real
+// Prisma enum is the right tool, exactly like ActivationChannel/ActivationStatus.
+enum OutcomeEventType {
+  DELIVERED
+  OPENED
+  CLICKED
+  REPLIED
+  POSITIVE_REPLY
+  NEGATIVE_REPLY
+  MEETING_BOOKED
+  MEETING_HELD
+  OPPORTUNITY_CREATED
+  OPPORTUNITY_WON
+  OPPORTUNITY_LOST
+  NO_RESPONSE
+  UNSUBSCRIBED
+}
+
+model OutcomeEvent {
+  id        String  @id @default(cuid())
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  // Optional: an outcome can be recorded at the account level without tying
+  // it to one specific draft (e.g. a deal closing weeks after several
+  // activations), but when an activationId IS given, server-side validation
+  // (lib/outcomes/record.ts) requires it actually belongs to this account —
+  // never trusted from the client, never left to attach to an unrelated one.
+  contactId String?
+  contact   Contact? @relation(fields: [contactId], references: [id])
+
+  activationId String?
+  activation   Activation? @relation(fields: [activationId], references: [id])
+
+  type       OutcomeEventType
+  occurredAt DateTime // when the event actually happened, not when it was recorded
+  source     String // how this was captured, e.g. "manual" — every event today, since no external integration exists yet
+  metadata   Json? // optional free-form detail (e.g. notes), Zod-validated at the app layer
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId])
+  @@index([contactId])
+  @@index([activationId])
+  @@index([type])
+  @@index([occurredAt])
+}
